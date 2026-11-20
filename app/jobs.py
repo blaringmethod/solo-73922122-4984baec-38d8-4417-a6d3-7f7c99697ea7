@@ -1,14 +1,14 @@
 """后台计算调度。
 
 - 计算在固定线程池中执行，HTTP 请求只负责入队，不阻塞样本/目标更正；
+- 作业登记是原子的：输入检查、epoch 与快照对应同一份已提交输入；
 - 作业启动前与求解过程中检查 epoch：一旦输入被修改（cancel 事件置位
   或库内 epoch 变化），在途作业立即放弃且不写任何结果；
-- 只有作业仍属于当前 epoch 时才写入终态结果（完整权重或冲突集）。
+- 只有作业仍属于当前 epoch 时才（原子地）写入终态结果（完整权重或冲突集）。
 """
 
 from __future__ import annotations
 
-import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from . import solver
@@ -22,11 +22,18 @@ class JobManager:
             max_workers=max_workers, thread_name_prefix="weight-worker"
         )
 
-    def submit(self) -> dict:
-        snap = self.db.snapshot()
-        job = self.db.create_job(snap)
+    def submit(self) -> tuple[dict | None, str | None]:
+        """原子登记作业并交给后台线程池（不阻塞样本/目标更正）。
+
+        输入齐全性检查、作业 epoch 与输入快照在 db.register_job 的同一
+        临界区内完成；输入不全时返回 (None, "samples"|"targets")，
+        不登记任何作业。
+        """
+        job, missing = self.db.register_job()
+        if job is None:
+            return None, missing
         self.pool.submit(self._run, job["job_id"])
-        return job
+        return job, None
 
     def shutdown(self) -> None:
         self.pool.shutdown(wait=False, cancel_futures=True)
@@ -104,11 +111,9 @@ class JobManager:
         self._finish_if_current(job_id, job_epoch, "succeeded", payload, None)
 
     def _finish_if_current(self, job_id, job_epoch, status, result, error):
-        if self.db.get_epoch() != job_epoch:
-            return  # 输入已变更，结果永久作废，不写入
-        if self.db.get_job(job_id) is None:
-            return
-        self.db.finish_job(job_id, status, result, error)
+        # epoch 核对与终态写入在同一临界区内原子完成：
+        # 输入已变更时结果永久作废，绝不落库
+        self.db.finish_job_if_current(job_id, job_epoch, status, result, error)
 
     @staticmethod
     def _assemble(samples, targets, w):

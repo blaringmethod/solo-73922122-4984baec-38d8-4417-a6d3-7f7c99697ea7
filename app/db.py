@@ -4,7 +4,13 @@
 - 每次成功提交样本或目标修改（PUT/DELETE）都会令全局 epoch +1；
 - epoch 变更会删除全部旧作业记录，并置位取消事件，使在途计算永久失效
   （即使把数据改回原值也不会恢复旧结果，必须重新计算）；
-- 结果只在作业成功完成时随作业原子写入，不存在“半份结果”；
+- 作业登记是原子的：输入齐全性检查、epoch 与输入快照在同一临界区内完成，
+  三者永远对应同一份已提交的样本与目标；输入不全时不登记任何作业；
+- 结果只在作业成功完成时随作业原子写入，且写入前原子核对 epoch，
+  不存在“半份结果”，在途作业被取消后绝不落库；
+- 读取侧（作业查询 / /result）只交付 epoch 与快照都和当前已提交输入
+  逐字段一致的作业；沿用旧库时，错配记录被跳过/视为失效，
+  不会挡住当前版本的有效结果；
 - 进程重启后所有未完成作业标记为 interrupted，不开放任何部分结果。
 """
 
@@ -110,20 +116,101 @@ class Database:
         row = self._conn.execute("SELECT * FROM jobs WHERE job_id=?", (job_id,)).fetchone()
         return dict(row) if row else None
 
-    def latest_succeeded_job(self) -> dict | None:
-        row = self._conn.execute(
-            "SELECT * FROM jobs WHERE status='succeeded' "
-            "ORDER BY finished_at DESC LIMIT 1"
-        ).fetchone()
-        return dict(row) if row else None
+    def _inputs_match_locked(self, snap: dict) -> bool:
+        """调用方必须持有 _write_lock。
+
+        作业快照须与当前已提交的样本/目标逐字段一致，且快照内 epoch
+        等于当前 epoch（“改回原值”后 epoch 已变，内容相同也不算一致）。
+        """
+        return self._snap_matches(
+            snap, self.epoch, self.list_samples(), self.list_targets()
+        )
+
+    @staticmethod
+    def _snap_matches(snap: dict, epoch: int,
+                      samples: list[dict], targets: list[dict]) -> bool:
+        return (
+            snap.get("epoch") == epoch
+            and snap.get("samples") == samples
+            and snap.get("targets") == targets
+        )
+
+    @staticmethod
+    def _parse_snapshot(row: dict) -> dict | None:
+        try:
+            snap = json.loads(row["input_snapshot"])
+        except (TypeError, ValueError):
+            return None
+        return snap if isinstance(snap, dict) else None
+
+    def get_current_job(self, job_id: str) -> dict | None:
+        """仅当作业存在、且其 epoch 与快照都和当前已提交输入一致时返回该作业。
+
+        错配版本（旧 epoch，或旧库遗留的“旧快照登记为新版本”记录）一律
+        视为已永久失效，返回 None，绝不向外交付其权重。
+        """
+        with self._write_lock:
+            row = self._conn.execute(
+                "SELECT * FROM jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            row = dict(row)
+            if row["epoch"] != self.epoch:
+                return None
+            snap = self._parse_snapshot(row)
+            if snap is None or not self._inputs_match_locked(snap):
+                return None
+            return row
+
+    def latest_consistent_succeeded_job(self) -> dict | None:
+        """返回与当前已提交输入逐字段一致的最近成功作业。
+
+        错配记录（旧 epoch，或旧库遗留的快照与版本不符的记录）直接跳过，
+        不会挡住当前版本的有效结果。
+        """
+        with self._write_lock:
+            rows = self._conn.execute(
+                "SELECT * FROM jobs WHERE status='succeeded' AND epoch=? "
+                "ORDER BY finished_at DESC LIMIT 200",
+                (self.epoch,),
+            ).fetchall()
+            samples, targets = self.list_samples(), self.list_targets()
+            for row in rows:
+                row = dict(row)
+                snap = self._parse_snapshot(row)
+                if snap is not None and self._snap_matches(
+                        snap, self.epoch, samples, targets):
+                    return row
+            return None
 
     def list_jobs(self, limit: int = 50) -> list[dict]:
-        rows = self._conn.execute(
-            "SELECT job_id, epoch, status, submitted_at, finished_at, error "
-            "FROM jobs ORDER BY submitted_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        """列出当前版本的最近作业；错配记录（旧库遗留）不列出。"""
+        with self._write_lock:
+            rows = self._conn.execute(
+                "SELECT * FROM jobs WHERE epoch=? "
+                "ORDER BY submitted_at DESC LIMIT 200",
+                (self.epoch,),
+            ).fetchall()
+            samples, targets = self.list_samples(), self.list_targets()
+            out = []
+            for row in rows:
+                row = dict(row)
+                snap = self._parse_snapshot(row)
+                if snap is None or not self._snap_matches(
+                        snap, self.epoch, samples, targets):
+                    continue
+                out.append({
+                    "job_id": row["job_id"],
+                    "epoch": row["epoch"],
+                    "status": row["status"],
+                    "submitted_at": row["submitted_at"],
+                    "finished_at": row["finished_at"],
+                    "error": row["error"],
+                })
+                if len(out) >= limit:
+                    break
+            return out
 
     # ------------------------------------------------------------------ 写入
     def _bump_epoch_locked(self) -> int:
@@ -174,18 +261,36 @@ class Database:
         with self._write_lock:
             return self._cancel
 
-    def create_job(self, snapshot: dict) -> dict:
+    def register_job(self) -> tuple[dict | None, str | None]:
+        """原子登记作业：输入齐全性检查、epoch、输入快照在同一临界区内完成。
+
+        登记下来的作业，其版本号与快照永远对应同一份已提交的样本与目标——
+        不会在通过检查后拿到空输入，也不会把旧快照登记为新版本。
+
+        返回 (job, None)；当前版本缺少样本或目标时返回
+        (None, "samples"|"targets")，且不登记任何作业。
+        """
         with self._write_lock:
+            samples = self.list_samples()
+            targets = self.list_targets()
+            if not samples:
+                return None, "samples"
+            if not targets:
+                return None, "targets"
+            snapshot = {
+                "epoch": self.epoch,
+                "samples": samples,
+                "targets": targets,
+            }
             job_id = uuid.uuid4().hex
-            now = _now()
-            epoch = self.epoch
             self._conn.execute(
                 "INSERT INTO jobs(job_id, epoch, status, submitted_at, input_snapshot) "
                 "VALUES (?,?,?,?,?)",
-                (job_id, epoch, "queued", now, json.dumps(snapshot, ensure_ascii=False)),
+                (job_id, self.epoch, "queued", _now(),
+                 json.dumps(snapshot, ensure_ascii=False)),
             )
             self._conn.commit()
-            return self.get_job(job_id)  # type: ignore[return-value]
+            return self.get_job(job_id), None
 
     def mark_running(self, job_id: str) -> None:
         with self._write_lock:
@@ -195,14 +300,22 @@ class Database:
             )
             self._conn.commit()
 
-    def finish_job(self, job_id: str, status: str, result: dict | None,
-                   error: str | None) -> None:
+    def finish_job_if_current(self, job_id: str, epoch: int, status: str,
+                              result: dict | None, error: str | None) -> bool:
+        """仅当库内 epoch 仍等于作业 epoch 时原子写入终态；返回是否写入。
+
+        epoch 检查与 UPDATE 在同一临界区内完成，且 UPDATE 自带 epoch 条件：
+        输入一旦变更，在途作业的结果永久作废，绝不落库。
+        """
         with self._write_lock:
-            self._conn.execute(
+            if self.epoch != epoch:
+                return False
+            cur = self._conn.execute(
                 "UPDATE jobs SET status=?, finished_at=?, result=?, error=? "
-                "WHERE job_id=?",
+                "WHERE job_id=? AND epoch=?",
                 (status, _now(),
                  json.dumps(result, ensure_ascii=False) if result is not None else None,
-                 error, job_id),
+                 error, job_id, epoch),
             )
             self._conn.commit()
+            return cur.rowcount > 0

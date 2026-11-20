@@ -87,12 +87,14 @@ def get_targets():
 @app.post("/calculate", status_code=202, tags=["计算"],
           summary="提交后台权重计算（不阻塞，返回 job_id）")
 def calculate():
-    snap = db().snapshot()
-    if not snap["samples"]:
-        raise HTTPException(422, "当前没有样本，无法计算：请先 PUT /samples")
-    if not snap["targets"]:
+    # 输入齐全性检查、作业 epoch 与输入快照在同一临界区内原子完成：
+    # 登记下来的作业永远对应当前已提交的样本与目标——不会在通过检查后
+    # 拿到空输入，也不会把旧快照登记为新版本；输入不全时 422 且不登记作业。
+    job, missing = jobs().submit()
+    if job is None:
+        if missing == "samples":
+            raise HTTPException(422, "当前没有样本，无法计算：请先 PUT /samples")
         raise HTTPException(422, "当前没有目标，无法计算：请先 PUT /targets")
-    job = jobs().submit()
     return JSONResponse(
         status_code=202,
         content={"job_id": job["job_id"], "epoch": job["epoch"],
@@ -141,7 +143,9 @@ def list_jobs():
 @app.get("/jobs/{job_id}", tags=["计算"],
          summary="查询作业状态与完整结果（仅成功时返回权重，失败/中断无半份结果）")
 def get_job(job_id: str):
-    row = db().get_job(job_id)
+    # 只交付 epoch 与快照都和当前已提交输入一致的作业；
+    # 错配版本（含旧库遗留记录）一律视为已永久失效
+    row = db().get_current_job(job_id)
     if row is None:
         raise HTTPException(404, "作业不存在或已因输入变更而永久失效")
     return _serialize_job(row)
@@ -150,23 +154,16 @@ def get_job(job_id: str):
 @app.get("/result", tags=["计算"],
          summary="取用与当前输入一致的完整权重；无可用完整结果时返回 409")
 def get_result():
-    row = db().latest_succeeded_job()
+    # 只取与当前已提交输入逐字段一致的成功结果；
+    # 错配记录被跳过，不会挡住当前版本的有效结果
+    row = db().latest_consistent_succeeded_job()
     if row is None:
         raise HTTPException(
             409,
             "当前没有与现有输入一致的完整权重结果（尚未计算、计算中、冲突、"
             "数值失败或进程重启均不开放半份结果）",
         )
-    data = _serialize_job(dict(row))
-    # 一致性核对：作业快照必须与当前输入逐字段一致
-    current = db().snapshot()
-    snap = data["input_snapshot"]
-    if snap.get("samples") != current["samples"] or \
-            snap.get("targets") != current["targets"] or \
-            snap.get("epoch") != current["epoch"]:
-        # 理论上不会发生（epoch 变更即清除作业），双保险
-        raise HTTPException(409, "结果与当前输入不一致，已拒绝取用，请重新计算")
-    return data
+    return _serialize_job(row)
 
 
 @app.get("/health", tags=["系统"], summary="健康检查")
